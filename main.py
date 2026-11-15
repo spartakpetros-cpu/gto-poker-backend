@@ -16,10 +16,8 @@ app.add_middleware(
 ROOM_PASSWORD = "12345qwerty"
 MAX_PLAYERS = 9
 
-# Классическая колода
 RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
 SUITS = ['♠', '♥', '♦', '♣']
-# Позиции без цифр (чтобы фронтенд корректно их прочитал)
 POSITIONS = ['SB', 'BB', 'UTG', 'EP', 'MP', 'LJ', 'HJ', 'CO', 'BTN']
 
 def get_deck():
@@ -46,7 +44,6 @@ class ConnectionManager:
                 pass
                 
     async def send_personal_message(self, message: str, websocket: WebSocket):
-        # Отправляем сообщение только одному конкретному игроку
         try:
             await websocket.send_text(message)
         except:
@@ -76,7 +73,13 @@ async def websocket_endpoint(websocket: WebSocket):
         player_name = auth.get("name", "Аноним")
         manager.add_player(websocket, player_name)
         
-        await websocket.send_text(json.dumps({"status": "auth_ok"}))
+        # ИСПРАВЛЕНИЕ: Отправляем новому игроку текущий список всех сидящих
+        current_players = list(manager.active_connections.values())
+        await websocket.send_text(json.dumps({
+            "status": "auth_ok", 
+            "players": current_players
+        }))
+        
         await manager.broadcast(json.dumps({"log": f"👋 {player_name} сел за стол ({len(manager.active_connections)}/{MAX_PLAYERS})."}))
         
         while True:
@@ -87,24 +90,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 action = action_data["button"]
                 
                 if action == "Deal":
-                    # Логика раздачи карт
                     players = list(manager.active_connections.items())
                     deck = get_deck()
                     
-                    # Оповещаем всех, что началась раздача
                     await manager.broadcast(json.dumps({"log": f"🎲 {player_name} раздает карты..."}))
                     
-                    # Выдаем каждому приватно по 2 карты и позицию
                     for i, (ws_conn, p_name) in enumerate(players):
                         pos = POSITIONS[i % len(POSITIONS)]
                         card1 = deck.pop()
                         card2 = deck.pop()
-                        
-                        # Формируем строку строго в том формате, который ждет фронтенд
                         hand_msg = f"Раздача! Позиция: {pos} | Карты: {card1} {card2}"
                         await manager.send_personal_message(json.dumps({"log": hand_msg}), ws_conn)
                 else:
-                    # Обычные игровые действия (Fold/Call/Raise) видят все
                     await manager.broadcast(json.dumps({"log": f"🃏 {player_name}: {action}"}))
                     
     except WebSocketDisconnect:

@@ -15,7 +15,7 @@ app.add_middleware(
 
 ROOM_PASSWORD = "12345qwerty"
 MAX_PLAYERS = 9
-STARTING_STACK = 10000 # Стартовый капитал
+STARTING_STACK = 10000
 
 RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
 SUITS = ['♠', '♥', '♦', '♣']
@@ -28,7 +28,6 @@ def get_deck():
 
 class ConnectionManager:
     def __init__(self):
-        # Храним полные данные: { "Спартак": {"ws": websocket, "stack": 10000, "cards": [], "pos": ""} }
         self.players = {} 
         self.turn_order = [] 
         self.turn_index = 0
@@ -36,19 +35,22 @@ class ConnectionManager:
         self.deck = []
 
     async def connect(self, websocket: WebSocket, name: str):
+        # ЗАЩИТА ОТ ДУБЛИКАТОВ: если имя занято И игрок сейчас реально в сети (ws не пустой)
+        if name in self.players and self.players[name]["ws"] is not None:
+            return "busy"
+            
         if name not in self.players:
             if len(self.players) >= MAX_PLAYERS:
-                return False
+                return "full"
             self.players[name] = {"ws": websocket, "stack": STARTING_STACK, "cards": [], "pos": ""}
             self.turn_order.append(name)
         else:
-            # Игрок вернулся (F5)
+            # Игрок вернулся (F5) под своим именем
             self.players[name]["ws"] = websocket
-        return True
+        return "ok"
 
     def disconnect(self, name: str):
         if name in self.players:
-            # Обрыв связи: просто стираем сокет, но оставляем карты и стек
             self.players[name]["ws"] = None
 
     async def broadcast(self, message: str):
@@ -74,7 +76,6 @@ class ConnectionManager:
             self.turn_index = 0
 
     async def broadcast_state(self):
-        # Отправляем список объектов {name, stack}
         players_info = [{"name": p, "stack": self.players[p]["stack"]} for p in self.turn_order]
         await self.broadcast(json.dumps({
             "players_update": players_info, 
@@ -98,11 +99,15 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
             return
             
-        player_name = auth.get("name", "Аноним")
+        player_name = auth.get("name", "Аноним").strip()
         
-        success = await manager.connect(websocket, player_name)
-        if not success:
-            await websocket.send_text(json.dumps({"error": "Стол заполнен"}))
+        result = await manager.connect(websocket, player_name)
+        if result == "busy":
+            await websocket.send_text(json.dumps({"error": "Это имя уже занято за столом!"}))
+            await websocket.close()
+            return
+        elif result == "full":
+            await websocket.send_text(json.dumps({"error": "Стол заполнен (9/9)"}))
             await websocket.close()
             return
             
@@ -110,7 +115,6 @@ async def websocket_endpoint(websocket: WebSocket):
         await manager.broadcast(json.dumps({"log": f"👋 {player_name} в сети."}))
         await manager.broadcast_state()
         
-        # Если игра идет, и у вернувшегося игрока есть карты - напоминаем ему их!
         if manager.game_in_progress and manager.players[player_name]["cards"]:
             cards = manager.players[player_name]["cards"]
             pos = manager.players[player_name]["pos"]
@@ -155,5 +159,5 @@ async def websocket_endpoint(websocket: WebSocket):
                     
     except WebSocketDisconnect:
         manager.disconnect(player_name)
-        await manager.broadcast(json.dumps({"log": f"📡 {player_name} временно отключился (но остался за столом)."}))
+        await manager.broadcast(json.dumps({"log": f"📡 {player_name} временно отключился."}))
         await manager.broadcast_state()

@@ -15,6 +15,7 @@ app.add_middleware(
 
 ROOM_PASSWORD = "12345qwerty"
 MAX_PLAYERS = 9
+STARTING_STACK = 10000 # Стартовый капитал
 
 RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
 SUITS = ['♠', '♥', '♦', '♣']
@@ -27,49 +28,58 @@ def get_deck():
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: dict[WebSocket, str] = {}
+        # Храним полные данные: { "Спартак": {"ws": websocket, "stack": 10000, "cards": [], "pos": ""} }
+        self.players = {} 
+        self.turn_order = [] 
         self.turn_index = 0
         self.game_in_progress = False
+        self.deck = []
 
-    def add_player(self, websocket: WebSocket, name: str):
-        self.active_connections[websocket] = name
+    async def connect(self, websocket: WebSocket, name: str):
+        if name not in self.players:
+            if len(self.players) >= MAX_PLAYERS:
+                return False
+            self.players[name] = {"ws": websocket, "stack": STARTING_STACK, "cards": [], "pos": ""}
+            self.turn_order.append(name)
+        else:
+            # Игрок вернулся (F5)
+            self.players[name]["ws"] = websocket
+        return True
 
-    def remove_player(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            del self.active_connections[websocket]
-        self.game_in_progress = False # Защита
+    def disconnect(self, name: str):
+        if name in self.players:
+            # Обрыв связи: просто стираем сокет, но оставляем карты и стек
+            self.players[name]["ws"] = None
 
     async def broadcast(self, message: str):
-        for connection in list(self.active_connections.keys()):
-            try: await connection.send_text(message)
-            except: pass
+        for data in self.players.values():
+            if data["ws"]:
+                try: await data["ws"].send_text(message)
+                except: pass
                 
-    async def send_personal_message(self, message: str, websocket: WebSocket):
-        try: await websocket.send_text(message)
-        except: pass
+    async def send_personal(self, name: str, message: str):
+        ws = self.players.get(name, {}).get("ws")
+        if ws:
+            try: await ws.send_text(message)
+            except: pass
 
     def get_current_turn_name(self):
-        if not self.active_connections: return None
-        players = list(self.active_connections.values())
-        if self.turn_index >= len(players): self.turn_index = 0
-        return players[self.turn_index]
+        if not self.turn_order: return None
+        if self.turn_index >= len(self.turn_order): self.turn_index = 0
+        return self.turn_order[self.turn_index]
 
     def advance_turn(self):
         self.turn_index += 1
-        if self.turn_index >= len(self.active_connections):
+        if self.turn_index >= len(self.turn_order):
             self.turn_index = 0
 
-    # НОВЫЙ МЕТОД: Рассылка точного состояния стола всем
     async def broadcast_state(self):
-        # Оставляем только уникальные имена, сохраняя порядок посадки
-        players_list = []
-        for name in self.active_connections.values():
-            if name not in players_list:
-                players_list.append(name)
-                
+        # Отправляем список объектов {name, stack}
+        players_info = [{"name": p, "stack": self.players[p]["stack"]} for p in self.turn_order]
         await self.broadcast(json.dumps({
-            "players_update": players_list, 
-            "active_turn": self.get_current_turn_name() if self.game_in_progress else None
+            "players_update": players_info, 
+            "active_turn": self.get_current_turn_name() if self.game_in_progress else None,
+            "game_in_progress": self.game_in_progress
         }))
 
 manager = ConnectionManager()
@@ -88,17 +98,25 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
             return
             
-        if len(manager.active_connections) >= MAX_PLAYERS:
+        player_name = auth.get("name", "Аноним")
+        
+        success = await manager.connect(websocket, player_name)
+        if not success:
             await websocket.send_text(json.dumps({"error": "Стол заполнен"}))
             await websocket.close()
             return
             
-        player_name = auth.get("name", "Аноним")
-        manager.add_player(websocket, player_name)
-        
         await websocket.send_text(json.dumps({"status": "auth_ok"}))
-        await manager.broadcast(json.dumps({"log": f"👋 {player_name} сел за стол."}))
-        await manager.broadcast_state() # Жесткая синхронизация при входе
+        await manager.broadcast(json.dumps({"log": f"👋 {player_name} в сети."}))
+        await manager.broadcast_state()
+        
+        # Если игра идет, и у вернувшегося игрока есть карты - напоминаем ему их!
+        if manager.game_in_progress and manager.players[player_name]["cards"]:
+            cards = manager.players[player_name]["cards"]
+            pos = manager.players[player_name]["pos"]
+            await manager.send_personal(player_name, json.dumps({
+                "log": f"🔄 Возврат в игру! Позиция: {pos} | Карты: {cards[0]} {cards[1]}"
+            }))
         
         while True:
             data = await websocket.receive_text()
@@ -110,27 +128,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 if action == "Deal":
                     manager.game_in_progress = True
                     manager.turn_index = 0
-                    players = list(manager.active_connections.items())
-                    deck = get_deck()
+                    manager.deck = get_deck()
                     
                     await manager.broadcast(json.dumps({"log": f"🎲 {player_name} раздает карты...", "event": "new_hand"}))
                     
-                    for i, (ws_conn, p_name) in enumerate(players):
+                    for i, p_name in enumerate(manager.turn_order):
                         pos = POSITIONS[i % len(POSITIONS)]
-                        hand_msg = f"Раздача! Позиция: {pos} | Карты: {deck.pop()} {deck.pop()}"
-                        await manager.send_personal_message(json.dumps({"log": hand_msg}), ws_conn)
+                        card1 = manager.deck.pop()
+                        card2 = manager.deck.pop()
+                        
+                        manager.players[p_name]["cards"] = [card1, card2]
+                        manager.players[p_name]["pos"] = pos
+                        
+                        hand_msg = f"Раздача! Позиция: {pos} | Карты: {card1} {card2}"
+                        await manager.send_personal(p_name, json.dumps({"log": hand_msg}))
                     
-                    await manager.broadcast_state() # Синхронизация очереди
+                    await manager.broadcast_state()
                     
                 elif manager.game_in_progress:
                     if player_name == manager.get_current_turn_name():
                         await manager.broadcast(json.dumps({"log": f"🃏 {player_name}: {action}"}))
                         manager.advance_turn()
-                        await manager.broadcast_state() # Передача хода
+                        await manager.broadcast_state()
                     else:
                         await websocket.send_text(json.dumps({"log": "⚠️ Сейчас не ваш ход!"}))
                     
     except WebSocketDisconnect:
-        manager.remove_player(websocket)
-        await manager.broadcast(json.dumps({"log": f"🚪 {player_name} покинул стол.", "event": "player_left"}))
-        await manager.broadcast_state() # Жесткая синхронизация при выходе
+        manager.disconnect(player_name)
+        await manager.broadcast(json.dumps({"log": f"📡 {player_name} временно отключился (но остался за столом)."}))
+        await manager.broadcast_state()

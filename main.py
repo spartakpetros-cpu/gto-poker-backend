@@ -35,18 +35,19 @@ class ConnectionManager:
         self.deck = []
 
     async def connect(self, websocket: WebSocket, name: str):
-        # ЗАЩИТА ОТ ДУБЛИКАТОВ: если имя занято И игрок сейчас реально в сети (ws не пустой)
-        if name in self.players and self.players[name]["ws"] is not None:
-            return "busy"
-            
-        if name not in self.players:
-            if len(self.players) >= MAX_PLAYERS:
-                return "full"
-            self.players[name] = {"ws": websocket, "stack": STARTING_STACK, "cards": [], "pos": ""}
-            self.turn_order.append(name)
-        else:
-            # Игрок вернулся (F5) под своим именем
+        if name in self.players:
+            # Если сокет еще жив — это реальный дубликат, не пускаем
+            if self.players[name]["ws"] is not None:
+                return "busy"
+            # Если сокет мертв (вы сделали F5) — разрешаем переподключение
             self.players[name]["ws"] = websocket
+            return "ok"
+            
+        if len(self.players) >= MAX_PLAYERS:
+            return "full"
+            
+        self.players[name] = {"ws": websocket, "stack": STARTING_STACK, "cards": [], "pos": ""}
+        self.turn_order.append(name)
         return "ok"
 
     def disconnect(self, name: str):

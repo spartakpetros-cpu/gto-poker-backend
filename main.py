@@ -1,6 +1,5 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-import random
 import json
 
 app = FastAPI()
@@ -13,45 +12,72 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Колода и позиции
-RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
-SUITS = ['♠', '♥', '♦', '♣']
-POSITIONS = ['UTG', 'MP', 'CO', 'BTN', 'SB', 'BB']
+# Ваши настройки приватной комнаты
+ROOM_PASSWORD = "12345qwerty"
+MAX_PLAYERS = 9
 
-def generate_hand():
-    card1 = f"{random.choice(RANKS)}{random.choice(SUITS)}"
-    card2 = f"{random.choice(RANKS)}{random.choice(SUITS)}"
-    # Проверка, чтобы не раздать две одинаковые карты
-    while card1 == card2:
-        card2 = f"{random.choice(RANKS)}{random.choice(SUITS)}"
-    return card1, card2, random.choice(POSITIONS)
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[WebSocket, str] = {}
+
+    def add_player(self, websocket: WebSocket, name: str):
+        self.active_connections[websocket] = name
+
+    def remove_player(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            del self.active_connections[websocket]
+
+    async def broadcast(self, message: str):
+        # Рассылаем сообщение всем игрокам за столом
+        for connection in list(self.active_connections.keys()):
+            try:
+                await connection.send_text(message)
+            except:
+                pass
+
+manager = ConnectionManager()
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    player_name = "Неизвестный"
+    
     try:
+        # 1. Ждем попытку входа (Имя + Пароль)
+        data = await websocket.receive_text()
+        auth = json.loads(data)
+        
+        # 2. Проверяем пароль
+        if auth.get("password") != ROOM_PASSWORD:
+            await websocket.send_text(json.dumps({"error": "Неверный пароль"}))
+            await websocket.close()
+            return
+            
+        # 3. Проверяем наличие свободных мест
+        if len(manager.active_connections) >= MAX_PLAYERS:
+            await websocket.send_text(json.dumps({"error": "Стол заполнен (9/9)"}))
+            await websocket.close()
+            return
+            
+        # 4. Успешный вход: сажаем за стол
+        player_name = auth.get("name", "Аноним")
+        manager.add_player(websocket, player_name)
+        
+        # Даем отмашку фронтенду, что пустили, и оповещаем всех
+        await websocket.send_text(json.dumps({"status": "auth_ok"}))
+        await manager.broadcast(json.dumps({"log": f"👋 {player_name} сел за стол ({len(manager.active_connections)}/{MAX_PLAYERS})."}))
+        
+        # 5. Основной игровой цикл (Слушаем ходы)
         while True:
-            # 1. Генерируем новую раздачу
-            card1, card2, pos = generate_hand()
-            
-            # 2. Отправляем игроку вопрос
-            await websocket.send_text(f"🎲 Раздача! Позиция: {pos} | Карты: {card1} {card2}")
-            
-            # 3. Ждем нажатия кнопки от фронтенда
             data = await websocket.receive_text()
-            action = json.loads(data).get("button")
+            action_data = json.loads(data)
             
-            # 4. Базовая заглушка оценки (пока без привязки к реальным чартам)
-            if action == "Fold":
-                feedback = "✅ Пас принят (Безопасное решение)."
-            elif action == "Raise":
-                feedback = "🔥 Рейз! (Агрессивно. Проверим по чарту позже)."
-            else:
-                feedback = "🤔 Колл (Требует осторожности)."
+            if "button" in action_data:
+                action = action_data["button"]
+                # Оповещаем всех за столом о действии игрока
+                await manager.broadcast(json.dumps({"log": f"🃏 {player_name}: {action}"}))
                 
-            # 5. Отправляем результат и черту-разделитель
-            await websocket.send_text(f"👉 Ваш ход: {action}. {feedback}")
-            await websocket.send_text("—" * 20)
-            
     except WebSocketDisconnect:
-        print("Клиент отключился")
+        # Игрок закрыл вкладку или пропал интернет
+        manager.remove_player(websocket)
+        await manager.broadcast(json.dumps({"log": f"🚪 {player_name} покинул стол ({len(manager.active_connections)}/{MAX_PLAYERS})."}))
